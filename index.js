@@ -34,7 +34,8 @@ const CONFIG = {
     CIRCUIT_BREAKER_COOLDOWN: 5 * 60 * 1000,
     MAILER_BATCH_SIZE: 800,
     MAX_USER_CACHE: 20000,
-    MAX_EPHEMERAL_STATE: 10000
+    MAX_EPHEMERAL_STATE: 10000,
+    BROADCAST_BATCH_SIZE: 1000
 };
 
 const RSSHUB_INSTANCES = [
@@ -342,7 +343,13 @@ const CachedRepo = {
 function findBayan(title, category) {
     if (!category) return null;
     const cutoff = Date.now() - 12 * 60 * 60 * 1000;
-    const recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? ORDER BY published_at DESC LIMIT 350').all(category, cutoff);
+    const normalized = (title || '').toLowerCase().replace(/[^а-яёa-z0-9]/g, '');
+    const titleHash = crypto.createHash('md5').update(normalized).digest('hex');
+    const hashPrefix = titleHash.slice(0, 8);
+    let recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? AND substr(title_hash, 1, 8) = ? ORDER BY published_at DESC LIMIT 120').all(category, cutoff, hashPrefix);
+    if (!recentNews.length) {
+        recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? ORDER BY published_at DESC LIMIT 180').all(category, cutoff);
+    }
     const getRoots = str => str.toLowerCase().replace(/[^а-яёa-z0-9]/gi, ' ').split(/\s+/).filter(w => w.length > 4).map(w => w.slice(0, 5));
     const roots1 = new Set(getRoots(title));
     if (roots1.size === 0) return null;
@@ -1414,24 +1421,36 @@ bot.on('message', async (ctx, next) => {
     broadcastState.delete(ctx.from.id);
     const isAll = state.targetCats.includes('ALL');
 
-    // Получаем аудиторию
-    let userIds;
+    let totalCount = 0;
     if (isAll) {
-        userIds = db.prepare('SELECT id FROM users').all().map(u => u.id);
+        totalCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
     } else {
-        const conditions = state.targetCats.map(() => 'categories LIKE ?').join(' OR ');
-        const params = state.targetCats.map(c => `%"${c}"%`);
-        userIds = db.prepare(`SELECT id FROM users WHERE ${conditions}`).all(...params).map(u => u.id);
+        const countConditions = state.targetCats.map(() => 'categories LIKE ?').join(' OR ');
+        const countParams = state.targetCats.map(c => `%"${c}"%`);
+        totalCount = db.prepare(`SELECT COUNT(*) as c FROM users WHERE ${countConditions}`).get(...countParams).c;
     }
 
-    const statusMsg = await ctx.reply(`⏳ Начинаю рассылку на ${userIds.length} получателей...`);
+    const statusMsg = await ctx.reply(`⏳ Начинаю рассылку на ${totalCount} получателей...`);
     let success = 0, failed = 0;
 
-    for (const uid of userIds) {
-        try {
-            await telegramDispatcher.enqueue(() => ctx.telegram.copyMessage(uid, ctx.from.id, ctx.message.message_id));
-            success++;
-        } catch (err) { failed++; }
+    let lastId = 0;
+    while (true) {
+        let usersBatch;
+        if (isAll) {
+            usersBatch = db.prepare('SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ?').all(lastId, CONFIG.BROADCAST_BATCH_SIZE);
+        } else {
+            const whereConditions = state.targetCats.map(() => 'categories LIKE ?').join(' OR ');
+            const params = state.targetCats.map(c => `%"${c}"%`);
+            usersBatch = db.prepare(`SELECT id FROM users WHERE id > ? AND (${whereConditions}) ORDER BY id LIMIT ?`).all(lastId, ...params, CONFIG.BROADCAST_BATCH_SIZE);
+        }
+        if (!usersBatch.length) break;
+        for (const row of usersBatch) {
+            lastId = row.id;
+            try {
+                await telegramDispatcher.enqueue(() => ctx.telegram.copyMessage(row.id, ctx.from.id, ctx.message.message_id));
+                success++;
+            } catch (err) { failed++; }
+        }
     }
 
     ctx.telegram.editMessageText(
