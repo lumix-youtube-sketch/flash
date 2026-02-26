@@ -31,7 +31,10 @@ const CONFIG = {
     RETRIES: 1,
     USER_AGENT: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
     CIRCUIT_BREAKER_THRESHOLD: 8,
-    CIRCUIT_BREAKER_COOLDOWN: 5 * 60 * 1000
+    CIRCUIT_BREAKER_COOLDOWN: 5 * 60 * 1000,
+    MAILER_BATCH_SIZE: 800,
+    MAX_USER_CACHE: 20000,
+    MAX_EPHEMERAL_STATE: 10000
 };
 
 const RSSHUB_INSTANCES = [
@@ -238,6 +241,9 @@ CREATE TABLE IF NOT EXISTS seen_log (user_id INTEGER, news_id INTEGER, PRIMARY K
 CREATE TABLE IF NOT EXISTS media_cache (url TEXT PRIMARY KEY, file_id TEXT, saved_at INTEGER);
 CREATE INDEX IF NOT EXISTS idx_news_pub ON news(published_at);
 CREATE INDEX IF NOT EXISTS idx_news_cat_pub ON news(category, published_at);
+CREATE INDEX IF NOT EXISTS idx_news_reg_pub ON news(region, published_at);
+CREATE INDEX IF NOT EXISTS idx_seen_log_news ON seen_log(news_id);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
 `);
 
 try { db.prepare('ALTER TABLE news ADD COLUMN merged_sources TEXT DEFAULT "[]"').run(); } catch(e) {}
@@ -293,12 +299,25 @@ const Repo = {
 };
 
 const userCache = new Map();
+
+function pruneMap(map, maxSize) {
+    if (map.size <= maxSize) return;
+    const removeCount = Math.floor(maxSize * 0.25);
+    let i = 0;
+    for (const key of map.keys()) {
+        map.delete(key);
+        i += 1;
+        if (i >= removeCount) break;
+    }
+}
+
 const CachedRepo = {
     get(id) {
         const cached = userCache.get(id);
         if (cached && Date.now() - cached.ts < 60000) return cached.user;
         const user = Repo.getUser(id);
         userCache.set(id, { user, ts: Date.now() });
+        pruneMap(userCache, CONFIG.MAX_USER_CACHE);
         return user;
     },
     saveSettings(user) {
@@ -323,7 +342,7 @@ const CachedRepo = {
 function findBayan(title, category) {
     if (!category) return null;
     const cutoff = Date.now() - 12 * 60 * 60 * 1000;
-    const recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ?').all(category, cutoff);
+    const recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? ORDER BY published_at DESC LIMIT 350').all(category, cutoff);
     const getRoots = str => str.toLowerCase().replace(/[^а-яёa-z0-9]/gi, ' ').split(/\s+/).filter(w => w.length > 4).map(w => w.slice(0, 5));
     const roots1 = new Set(getRoots(title));
     if (roots1.size === 0) return null;
@@ -776,6 +795,7 @@ bot.start(async ctx => {
     // Новый пользователь — онбординг
     const usersCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
     onboardingState.set(userId, { selectedCats: [] });
+    pruneMap(onboardingState, CONFIG.MAX_EPHEMERAL_STATE);
 
     await ctx.reply(
         `⚡️ <b>Добро пожаловать во Flash News!</b>\n\n` +
@@ -1218,10 +1238,18 @@ async function serveNextNews(ctx) {
 }
 
 const AutoMailer = {
+    _running: false,
     async run() {
-        const users = db.prepare('SELECT * FROM users').all();
+        if (this._running) return;
+        this._running = true;
+        try {
         const now = Date.now(); const currentHourMSK = (new Date().getUTCHours() + 3) % 24;
-        for (const rawUser of users) {
+        let lastId = 0;
+        while (true) {
+            const users = db.prepare(`SELECT * FROM users WHERE id > ? AND json_extract(notification_settings, '$.mode') != 'off' ORDER BY id LIMIT ?`).all(lastId, CONFIG.MAILER_BATCH_SIZE);
+            if (!users.length) break;
+            for (const rawUser of users) {
+                lastId = rawUser.id;
             let s; try { s = JSON.parse(rawUser.notification_settings || '{}'); } catch(e) { continue; }
             const user = {
                 ...rawUser, categories: (() => { try { return JSON.parse(rawUser.categories || '[]'); } catch { return []; } })(),
@@ -1261,14 +1289,20 @@ const AutoMailer = {
                 }
             }
         }
+        }
+        } finally {
+            this._running = false;
+        }
     }
 };
 
-const ingestTask = cron.schedule('*/5 * * * *', () => { void Ingester.run(); void AutoMailer.run(); });
+const ingestTask = cron.schedule('*/5 * * * *', () => { void Ingester.run(); });
+const mailerTask = cron.schedule('* * * * *', () => { void AutoMailer.run(); });
 const cleanupTask = cron.schedule('0 3 * * *', () => {
     const cutoffDate = Date.now() - (CONFIG.NEWS_TTL_DAYS * 24 * 60 * 60 * 1000);
     db.prepare('DELETE FROM news WHERE published_at < ?').run(cutoffDate);
     db.prepare('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)').run();
+    db.prepare('DELETE FROM seen_log WHERE rowid NOT IN (SELECT rowid FROM seen_log ORDER BY news_id DESC LIMIT 3000000)').run();
     // Удаляем старые записи кэша медиа (старше 7 дней)
     db.prepare('DELETE FROM media_cache WHERE saved_at < ?').run(Date.now() - 7 * 86400000);
     _mediaCacheMap.clear();
@@ -1302,6 +1336,7 @@ function getBroadcastTargetMenu(selectedCats) {
 bot.command('broadcast', async ctx => {
     if (!ADMIN_ID || String(ctx.from.id) !== ADMIN_ID) return ctx.reply('⛔ Нет доступа.');
     broadcastState.set(ctx.from.id, { targetCats: [], pendingMsgId: null });
+    pruneMap(broadcastState, CONFIG.MAX_EPHEMERAL_STATE);
     ctx.reply(
         `📣 <b>Новая рассылка</b>\n\nВыбери аудиторию — кому отправить сообщение:`,
         { parse_mode: 'HTML', ...getBroadcastTargetMenu([]) }
@@ -1396,7 +1431,6 @@ bot.on('message', async (ctx, next) => {
         try {
             await telegramDispatcher.enqueue(() => ctx.telegram.copyMessage(uid, ctx.from.id, ctx.message.message_id));
             success++;
-            await sleep(50);
         } catch (err) { failed++; }
     }
 
@@ -1419,6 +1453,6 @@ bot.on('message', async (ctx, next) => {
         bot,
         db,
         telegramDispatcher,
-        cronTasks: [ingestTask, cleanupTask]
+        cronTasks: [ingestTask, mailerTask, cleanupTask]
     });
 })();
