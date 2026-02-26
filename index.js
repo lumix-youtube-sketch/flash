@@ -16,6 +16,8 @@ const cron = require('node-cron');
 const pino = require('pino');
 const crypto = require('crypto');
 const iconv = require('iconv-lite');
+const { createTelegramDispatcher } = require('./src/infrastructure/telegramRateLimiter');
+const { setupGracefulShutdown } = require('./src/runtime/gracefulShutdown');
 
 const ADMIN_ID = process.env.ADMIN_ID ? String(process.env.ADMIN_ID).trim() : null;
 const logger = pino({ transport: { target: 'pino-pretty', options: { colorize: true } } });
@@ -688,6 +690,7 @@ const Ingester = {
 
 // ---------------- БОТ UI BUILDERS ----------------
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const telegramDispatcher = createTelegramDispatcher({ logger, maxPerSecond: 28 });
 
 bot.catch((err, ctx) => {
     logger.error(`[Global Error] ${ctx.updateType}: ${err.message}`);
@@ -766,7 +769,7 @@ bot.start(async ctx => {
     // Повторный /start у уже настроенного пользователя — просто меню
     if (user.onboarding_done) {
         const usersCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-        await ctx.reply(`👋 С возвращением!);
+        await ctx.reply('👋 С возвращением!');
         return ctx.reply('Главное меню:', getMenu(user));
     }
 
@@ -1147,12 +1150,12 @@ async function sendRaw(user, news, isManual = false, isSmart = false) {
         let cachedFileId = MediaCache.get(imgUrl);
         try {
             if (cachedFileId) {
-                await bot.telegram.sendPhoto(user.id, cachedFileId, { ...extra, caption });
+                await telegramDispatcher.enqueue(() => bot.telegram.sendPhoto(user.id, cachedFileId, { ...extra, caption }));
                 db.prepare('INSERT OR IGNORE INTO seen_log VALUES (?, ?)').run(user.id, news.id);
                 return;
             }
             // Сначала пробуем URL напрямую
-            const res = await bot.telegram.sendPhoto(user.id, imgUrl, { ...extra, caption });
+            const res = await telegramDispatcher.enqueue(() => bot.telegram.sendPhoto(user.id, imgUrl, { ...extra, caption }));
             if (res && res.photo) {
                 MediaCache.set(imgUrl, res.photo[res.photo.length - 1].file_id);
             }
@@ -1168,18 +1171,18 @@ async function sendRaw(user, news, isManual = false, isSmart = false) {
                     responseType: 'arraybuffer',
                     timeout: 12000
                 });
-                const res = await bot.telegram.sendPhoto(user.id, { source: Buffer.from(resp.data) }, { ...extra, caption });
+                const res = await telegramDispatcher.enqueue(() => bot.telegram.sendPhoto(user.id, { source: Buffer.from(resp.data) }, { ...extra, caption }));
                 if (res && res.photo) {
                     MediaCache.set(imgUrl, res.photo[res.photo.length - 1].file_id);
                 }
             } catch (e2) {
                 // Картинка недоступна — отправляем новость без фото
                 logger.warn(`[Image Fail] Sending without photo: ${e2.message}`);
-                try { await bot.telegram.sendMessage(user.id, caption, { ...extra, link_preview_options: { is_disabled: true } }); } catch(e){}
+                try { await telegramDispatcher.enqueue(() => bot.telegram.sendMessage(user.id, caption, { ...extra, link_preview_options: { is_disabled: true } })); } catch(e){}
             }
         }
     } else {
-        try { await bot.telegram.sendMessage(user.id, caption, { ...extra, link_preview_options: { is_disabled: true } }); } catch(e){}
+        try { await telegramDispatcher.enqueue(() => bot.telegram.sendMessage(user.id, caption, { ...extra, link_preview_options: { is_disabled: true } })); } catch(e){}
     }
 
     db.prepare('INSERT OR IGNORE INTO seen_log VALUES (?, ?)').run(user.id, news.id);
@@ -1261,8 +1264,8 @@ const AutoMailer = {
     }
 };
 
-cron.schedule('*/5 * * * *', () => { Ingester.run(); AutoMailer.run(); });
-cron.schedule('0 3 * * *', () => {
+const ingestTask = cron.schedule('*/5 * * * *', () => { void Ingester.run(); void AutoMailer.run(); });
+const cleanupTask = cron.schedule('0 3 * * *', () => {
     const cutoffDate = Date.now() - (CONFIG.NEWS_TTL_DAYS * 24 * 60 * 60 * 1000);
     db.prepare('DELETE FROM news WHERE published_at < ?').run(cutoffDate);
     db.prepare('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)').run();
@@ -1391,7 +1394,7 @@ bot.on('message', async (ctx, next) => {
 
     for (const uid of userIds) {
         try {
-            await ctx.telegram.copyMessage(uid, ctx.from.id, ctx.message.message_id);
+            await telegramDispatcher.enqueue(() => ctx.telegram.copyMessage(uid, ctx.from.id, ctx.message.message_id));
             success++;
             await sleep(50);
         } catch (err) { failed++; }
@@ -1409,6 +1412,13 @@ bot.on('message', async (ctx, next) => {
 
 (async () => {
     logger.info('Flash News v73.0 started. Admin ID: ' + ADMIN_ID);
-    await Ingester.run(); bot.launch();
-    process.once('SIGINT', () => { bot.stop(); db.close(); process.exit(0); });
+    await Ingester.run();
+    await bot.launch();
+    setupGracefulShutdown({
+        logger,
+        bot,
+        db,
+        telegramDispatcher,
+        cronTasks: [ingestTask, cleanupTask]
+    });
 })();
