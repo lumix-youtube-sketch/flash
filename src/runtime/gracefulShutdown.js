@@ -12,7 +12,7 @@ function setupGracefulShutdown({ logger, bot, db, telegramDispatcher, cronTasks 
 
     try { await telegramDispatcher.shutdown(); } catch (e) { logger.warn(`Queue shutdown error: ${e.message}`); }
     try { bot.stop(signal); } catch (e) { logger.warn(`Bot stop error: ${e.message}`); }
-    try { db.close(); } catch (e) { logger.warn(`DB close error: ${e.message}`); }
+    try { await db.close(); } catch (e) { logger.warn(`DB close error: ${e.message}`); }
 
     process.exit(0);
   }

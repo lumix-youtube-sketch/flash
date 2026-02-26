@@ -11,7 +11,7 @@ const { Telegraf, Markup } = require('telegraf');
 const RSSParser = require('rss-parser');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const Database = require('better-sqlite3');
+const { createPostgresDb } = require('./src/infrastructure/db/postgres');
 const cron = require('node-cron');
 const pino = require('pino');
 const crypto = require('crypto');
@@ -23,8 +23,7 @@ const ADMIN_ID = process.env.ADMIN_ID ? String(process.env.ADMIN_ID).trim() : nu
 const logger = pino({ transport: { target: 'pino-pretty', options: { colorize: true } } });
 
 const CONFIG = {
-    DB_PATH: 'flash_news_prod.db',
-    RSS_TIMEOUT: 15000,
+        RSS_TIMEOUT: 15000,
     SCRAPE_TIMEOUT: 10000,
     CONCURRENCY: 25,
     NEWS_TTL_DAYS: 3,
@@ -52,19 +51,19 @@ let rsshubIndex = 0;
 // Media cache теперь в SQLite — не теряется при перезапуске
 const _mediaCacheMap = new Map(); // L1: в памяти для скорости
 const MediaCache = {
-    get(url) {
+    async get(url) {
         if (_mediaCacheMap.has(url)) return _mediaCacheMap.get(url);
-        const row = db.prepare('SELECT file_id FROM media_cache WHERE url=?').get(url);
+        const row = await db.get('SELECT file_id FROM media_cache WHERE url=?', url);
         if (row) { _mediaCacheMap.set(url, row.file_id); return row.file_id; }
         return null;
     },
-    set(url, fileId) {
+    async set(url, fileId) {
         _mediaCacheMap.set(url, fileId);
-        db.prepare('INSERT OR REPLACE INTO media_cache (url, file_id, saved_at) VALUES (?,?,?)').run(url, fileId, Date.now());
+        await db.run('INSERT INTO media_cache (url, file_id, saved_at) VALUES (?,?,?) ON CONFLICT (url) DO UPDATE SET file_id=EXCLUDED.file_id, saved_at=EXCLUDED.saved_at', url, fileId, Date.now());
     },
-    clear() {
+    async clear() {
         _mediaCacheMap.clear();
-        db.prepare('DELETE FROM media_cache').run();
+        await db.run('DELETE FROM media_cache');
     }
 };
 
@@ -99,6 +98,7 @@ const REQUEST_HEADERS = {
 };
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const count = async (sql, ...args) => Number((await db.get(sql, ...args))?.c || 0);
 
 async function retry(fn, retries = CONFIG.RETRIES) {
     try { return await fn(); } catch (e) {
@@ -211,20 +211,20 @@ function cleanNewsBody(text) {
     return paragraphs.join('\n\n');
 }
 
-const db = new Database(CONFIG.DB_PATH);
-db.pragma('journal_mode = WAL');
+const db = createPostgresDb(process.env.DATABASE_URL || process.env.POSTGRES_URL);
 
-db.exec(`
+async function initDb() {
+    await db.exec(`
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
-    categories TEXT DEFAULT '[]',
-    regions TEXT DEFAULT '[]',
-    notification_settings TEXT DEFAULT '{"mode": "smart", "interval": 4, "limit": 3, "silent": false, "last_sent": 0, "last_source": "", "source_history": [], "night_mode": true, "smart_history": []}',
+    id BIGINT PRIMARY KEY,
+    categories JSONB DEFAULT '[]'::jsonb,
+    regions JSONB DEFAULT '[]'::jsonb,
+    notification_settings JSONB DEFAULT '{"mode":"smart","interval":4,"limit":3,"silent":false,"last_sent":0,"last_source":"","source_history":[],"night_mode":true,"smart_history":[]}'::jsonb,
     onboarding_done INTEGER DEFAULT 0,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT NOW()
 );
 CREATE TABLE IF NOT EXISTS news (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id BIGSERIAL PRIMARY KEY,
     hash TEXT UNIQUE,
     title_hash TEXT UNIQUE,
     title TEXT,
@@ -235,37 +235,40 @@ CREATE TABLE IF NOT EXISTS news (
     link TEXT,
     category TEXT,
     region TEXT,
-    published_at INTEGER,
-    merged_sources TEXT DEFAULT '[]'
+    published_at BIGINT,
+    merged_sources JSONB DEFAULT '[]'::jsonb
 );
-CREATE TABLE IF NOT EXISTS seen_log (user_id INTEGER, news_id INTEGER, PRIMARY KEY (user_id, news_id));
-CREATE TABLE IF NOT EXISTS media_cache (url TEXT PRIMARY KEY, file_id TEXT, saved_at INTEGER);
-CREATE INDEX IF NOT EXISTS idx_news_pub ON news(published_at);
-CREATE INDEX IF NOT EXISTS idx_news_cat_pub ON news(category, published_at);
-CREATE INDEX IF NOT EXISTS idx_news_reg_pub ON news(region, published_at);
-CREATE INDEX IF NOT EXISTS idx_seen_log_news ON seen_log(news_id);
-CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
+CREATE TABLE IF NOT EXISTS seen_log (
+    user_id BIGINT,
+    news_id BIGINT,
+    seen_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (user_id, news_id)
+);
+CREATE TABLE IF NOT EXISTS media_cache (url TEXT PRIMARY KEY, file_id TEXT, saved_at BIGINT);
+CREATE INDEX IF NOT EXISTS idx_news_category_pub ON news(category, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_news_region_pub ON news(region, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_seen_user ON seen_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_seen_user_news ON seen_log(user_id, news_id);
+CREATE INDEX IF NOT EXISTS idx_users_mode ON users((notification_settings->>'mode'));
 `);
-
-try { db.prepare('ALTER TABLE news ADD COLUMN merged_sources TEXT DEFAULT "[]"').run(); } catch(e) {}
-try { db.prepare('ALTER TABLE users ADD COLUMN onboarding_done INTEGER DEFAULT 0').run(); } catch(e) {}
+}
 
 const Repo = {
-    getUser(id) {
-        let u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+    async getUser(id) {
+        let u = await db.get('SELECT * FROM users WHERE id=?', id);
         if (!u) {
-            db.prepare('INSERT INTO users (id) VALUES (?)').run(id);
-            u = db.prepare('SELECT * FROM users WHERE id=?').get(id);
+            await db.run('INSERT INTO users (id) VALUES (?) ON CONFLICT (id) DO NOTHING', id);
+            u = await db.get('SELECT * FROM users WHERE id=?', id);
         }
-        const parsedSettings = JSON.parse(u.notification_settings || '{}');
-        let cats = JSON.parse(u.categories || '[]');
+        const parsedSettings = typeof u.notification_settings === 'string' ? JSON.parse(u.notification_settings || '{}') : (u.notification_settings || {});
+        let cats = Array.isArray(u.categories) ? u.categories : JSON.parse(u.categories || '[]');
         if (cats.includes('crypto') || cats.includes('finance_old') || cats.includes('music')) {
             cats = cats.filter(c => c !== 'crypto' && c !== 'finance_old' && c !== 'music');
             if (!cats.includes('finance')) cats.push('finance');
-            db.prepare('UPDATE users SET categories=? WHERE id=?').run(JSON.stringify(cats), id);
+            await db.run('UPDATE users SET categories=?::jsonb WHERE id=?', JSON.stringify(cats), id);
         }
         return {
-            ...u, categories: cats, regions: JSON.parse(u.regions || '[]'),
+            ...u, categories: cats, regions: Array.isArray(u.regions) ? u.regions : JSON.parse(u.regions || '[]'),
             onboarding_done: u.onboarding_done || 0,
             notification_settings: {
                 mode: parsedSettings.mode || (parsedSettings.enabled === false ? 'off' : 'smart'),
@@ -280,22 +283,20 @@ const Repo = {
             }
         };
     },
-    saveNews(n) {
+    async saveNews(n) {
         if (!n.body || n.body.length < 50) return false;
         const tHash = crypto.createHash('md5').update(n.title.toLowerCase().replace(/[^а-яёa-z0-9]/g, '')).digest('hex');
         try {
-            db.prepare(`INSERT INTO news (hash,title_hash,title,body,image_url,video_url,source_name,link,category,region,published_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(n.hash, tHash, n.title, n.body, n.image, n.video, n.source, n.link, n.cat, n.reg, n.pub);
+            await db.run(`INSERT INTO news (hash,title_hash,title,body,image_url,video_url,source_name,link,category,region,published_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`, n.hash, tHash, n.title, n.body, n.image, n.video, n.source, n.link, n.cat, n.reg, n.pub);
             return true;
         } catch { return false; }
     },
-    getUnseen(uid, cats, regs, limit = 1) {
+    async getUnseen(uid, cats, regs, limit = 1) {
         if (!cats.length && !regs.length) return [];
         const conditions = []; const args = [];
         if (cats.length) { conditions.push(`category IN (${cats.map(()=>'?').join(',')})`); args.push(...cats); }
         if (regs.length) { conditions.push(`region IN (${regs.map(()=>'?').join(',')})`); args.push(...regs); }
-        return db.prepare(`SELECT * FROM news WHERE (${conditions.join(' OR ')}) AND length(body) > 50 AND id NOT IN (SELECT news_id FROM seen_log WHERE user_id=?) ORDER BY published_at DESC LIMIT ?`)
-            .all(...args, uid, limit * 10);
+        return await db.all(`SELECT n.* FROM news n LEFT JOIN seen_log sl ON sl.news_id = n.id AND sl.user_id = ? WHERE (${conditions.join(' OR ')}) AND length(n.body) > 50 AND sl.news_id IS NULL ORDER BY n.published_at DESC LIMIT ?`, uid, ...args, limit * 10);
     }
 };
 
@@ -313,42 +314,42 @@ function pruneMap(map, maxSize) {
 }
 
 const CachedRepo = {
-    get(id) {
+    async get(id) {
         const cached = userCache.get(id);
         if (cached && Date.now() - cached.ts < 60000) return cached.user;
-        const user = Repo.getUser(id);
+        const user = await Repo.getUser(id);
         userCache.set(id, { user, ts: Date.now() });
         pruneMap(userCache, CONFIG.MAX_USER_CACHE);
         return user;
     },
-    saveSettings(user) {
-        db.prepare('UPDATE users SET notification_settings=? WHERE id=?').run(JSON.stringify(user.notification_settings), user.id);
+    async saveSettings(user) {
+        await db.run('UPDATE users SET notification_settings=?::jsonb WHERE id=?', JSON.stringify(user.notification_settings), user.id);
         userCache.set(user.id, { user, ts: Date.now() });
     },
-    saveCategories(user) {
-        db.prepare('UPDATE users SET categories=? WHERE id=?').run(JSON.stringify(user.categories), user.id);
+    async saveCategories(user) {
+        await db.run('UPDATE users SET categories=?::jsonb WHERE id=?', JSON.stringify(user.categories), user.id);
         userCache.set(user.id, { user, ts: Date.now() });
     },
-    saveRegions(user) {
-        db.prepare('UPDATE users SET regions=? WHERE id=?').run(JSON.stringify(user.regions), user.id);
+    async saveRegions(user) {
+        await db.run('UPDATE users SET regions=?::jsonb WHERE id=?', JSON.stringify(user.regions), user.id);
         userCache.set(user.id, { user, ts: Date.now() });
     },
-    saveOnboarding(user) {
-        db.prepare('UPDATE users SET onboarding_done=?, categories=? WHERE id=?').run(1, JSON.stringify(user.categories), user.id);
+    async saveOnboarding(user) {
+        await db.run('UPDATE users SET onboarding_done=?, categories=?::jsonb WHERE id=?', 1, JSON.stringify(user.categories), user.id);
         user.onboarding_done = 1;
         userCache.set(user.id, { user, ts: Date.now() });
     }
 };
 
-function findBayan(title, category) {
+async function findBayan(title, category) {
     if (!category) return null;
     const cutoff = Date.now() - 12 * 60 * 60 * 1000;
     const normalized = (title || '').toLowerCase().replace(/[^а-яёa-z0-9]/g, '');
     const titleHash = crypto.createHash('md5').update(normalized).digest('hex');
     const hashPrefix = titleHash.slice(0, 8);
-    let recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? AND substr(title_hash, 1, 8) = ? ORDER BY published_at DESC LIMIT 120').all(category, cutoff, hashPrefix);
+    let recentNews = await db.all('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? AND substring(title_hash from 1 for 8) = ? ORDER BY published_at DESC LIMIT 120', category, cutoff, hashPrefix);
     if (!recentNews.length) {
-        recentNews = db.prepare('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? ORDER BY published_at DESC LIMIT 180').all(category, cutoff);
+        recentNews = await db.all('SELECT id, title, source_name, merged_sources FROM news WHERE category = ? AND published_at > ? ORDER BY published_at DESC LIMIT 180', category, cutoff);
     }
     const getRoots = str => str.toLowerCase().replace(/[^а-яёa-z0-9]/gi, ' ').split(/\s+/).filter(w => w.length > 4).map(w => w.slice(0, 5));
     const roots1 = new Set(getRoots(title));
@@ -688,10 +689,10 @@ const Ingester = {
                     const bayan = findBayan(rawTitle, finalCat);
                     if (bayan) {
                         if (bayan.source_name !== src.n) {
-                            let merged = JSON.parse(bayan.merged_sources || '[]');
+                            let merged = Array.isArray(bayan.merged_sources) ? bayan.merged_sources : JSON.parse(bayan.merged_sources || '[]');
                             if (!merged.includes(src.n)) {
                                 merged.push(src.n);
-                                db.prepare('UPDATE news SET merged_sources=? WHERE id=?').run(JSON.stringify(merged), bayan.id);
+                                await db.run('UPDATE news SET merged_sources=?::jsonb WHERE id=?', JSON.stringify(merged), bayan.id);
                             }
                         }
                         continue;
@@ -790,17 +791,17 @@ function getOnboardingCatsMenu(selectedCats) {
 
 bot.start(async ctx => {
     const userId = ctx.from.id;
-    const user = CachedRepo.get(userId);
+    const user = await CachedRepo.get(userId);
 
     // Повторный /start у уже настроенного пользователя — просто меню
     if (user.onboarding_done) {
-        const usersCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+        const usersCount = await count('SELECT COUNT(*) as c FROM users');
         await ctx.reply('👋 С возвращением!');
         return ctx.reply('Главное меню:', getMenu(user));
     }
 
     // Новый пользователь — онбординг
-    const usersCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+    const usersCount = await count('SELECT COUNT(*) as c FROM users');
     onboardingState.set(userId, { selectedCats: [] });
     pruneMap(onboardingState, CONFIG.MAX_EPHEMERAL_STATE);
 
@@ -838,9 +839,9 @@ bot.action('ob_done', async ctx => {
     ctx.answerCbQuery().catch(() => {});
     const userId = ctx.from.id;
     const state = onboardingState.get(userId) || { selectedCats: [] };
-    const user = CachedRepo.get(userId);
+    const user = await CachedRepo.get(userId);
     user.categories = state.selectedCats;
-    CachedRepo.saveOnboarding(user);
+    await CachedRepo.saveOnboarding(user);
     onboardingState.delete(userId);
 
     await ctx.editMessageText(
@@ -862,7 +863,7 @@ bot.action('ob_none', ctx => ctx.answerCbQuery('Выберите хотя бы �
 
 bot.action('ob_go_regions', async ctx => {
     ctx.answerCbQuery().catch(() => {});
-    const user = CachedRepo.get(ctx.from.id);
+    const user = await CachedRepo.get(ctx.from.id);
     await ctx.editMessageText('📍 Выберите интересные вам регионы:', getRegionsMenu(user)).catch(() => {});
     // После регионов — финальное сообщение
     await ctx.reply(
@@ -880,10 +881,10 @@ bot.action('ob_skip_regions', async ctx => {
 });
 // ---- КОНЕЦ ОНБОРДИНГА ----
 
-bot.hears(['📱 Меню', '📱 Главное меню настроек', '/menu'], ctx => ctx.reply('Главное меню:', getMenu(CachedRepo.get(ctx.from.id))));
+bot.hears(['📱 Меню', '📱 Главное меню настроек', '/menu'], async ctx => ctx.reply('Главное меню:', getMenu(CachedRepo.get(ctx.from.id))));
 
 const adminState = {}; // legacy, не используется
-bot.command('admin', ctx => {
+bot.command('admin', async ctx => {
     if (!ADMIN_ID || String(ctx.from.id) !== ADMIN_ID) return ctx.reply('⛔ У вас нет доступа.');
 
     const now = Date.now();
@@ -893,41 +894,42 @@ bot.command('admin', ctx => {
     const day30 = now - 30 * 86400000;
 
     // Пользователи
-    const usersTotal   = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-    const usersActive  = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.mode') != 'off'").get().c;
-    const usersSmart   = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.mode') = 'smart'").get().c;
-    const usersCustom  = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.mode') = 'custom'").get().c;
-    const usersOff     = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.mode') = 'off'").get().c;
-    const usersNew24h  = db.prepare(`SELECT COUNT(*) as c FROM users WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?`).get(Math.floor(h24 / 1000)).c;
-    const usersNew7d   = db.prepare(`SELECT COUNT(*) as c FROM users WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?`).get(Math.floor(day7 / 1000)).c;
-    const usersNew30d  = db.prepare(`SELECT COUNT(*) as c FROM users WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?`).get(Math.floor(day30 / 1000)).c;
+    const usersTotal = await count('SELECT COUNT(*) as c FROM users');
+    const usersActive = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'mode' != 'off'");
+    const usersSmart = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'mode' = 'smart'");
+    const usersCustom = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'mode' = 'custom'");
+    const usersOff = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'mode' = 'off'");
+    const usersNew24h = await count(`SELECT COUNT(*) as c FROM users WHERE EXTRACT(EPOCH FROM created_at) >= ?`, Math.floor(h24 / 1000));
+    const usersNew7d = await count(`SELECT COUNT(*) as c FROM users WHERE EXTRACT(EPOCH FROM created_at) >= ?`, Math.floor(day7 / 1000));
+    const usersNew30d = await count(`SELECT COUNT(*) as c FROM users WHERE EXTRACT(EPOCH FROM created_at) >= ?`, Math.floor(day30 / 1000));
 
     // Вовлечённость (seen_log = факт прочтения)
-    const reads24h = db.prepare('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?').get(h24).c;
-    const reads7d  = db.prepare('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?').get(day7).c;
-    const totalReads = db.prepare('SELECT COUNT(*) as c FROM seen_log').get().c;
+    const reads24h = await count('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?', h24);
+    const reads7d = await count('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?', day7);
+    const totalReads = await count('SELECT COUNT(*) as c FROM seen_log');
 
     // Новости
-    const newsTotal   = db.prepare('SELECT COUNT(*) as c FROM news').get().c;
-    const news24h     = db.prepare('SELECT COUNT(*) as c FROM news WHERE published_at >= ?').get(h24).c;
-    const news7d      = db.prepare('SELECT COUNT(*) as c FROM news WHERE published_at >= ?').get(day7).c;
+    const newsTotal = await count('SELECT COUNT(*) as c FROM news');
+    const news24h = await count('SELECT COUNT(*) as c FROM news WHERE published_at >= ?', h24);
+    const news7d = await count('SELECT COUNT(*) as c FROM news WHERE published_at >= ?', day7);
 
-    // Топ категорий по количеству подписчиков
-    const catStats = Object.entries(CATEGORIES).map(([key, cat]) => {
-        const count = db.prepare(`SELECT COUNT(*) as c FROM users WHERE categories LIKE ?`).get(`%"${key}"%`).c;
-        return { name: cat.name, count };
-    }).sort((a, b) => b.count - a.count);
+    const catStats = [];
+    for (const [key, cat] of Object.entries(CATEGORIES)) {
+        const c = await count(`SELECT COUNT(*) as c FROM users WHERE categories::text LIKE ?`, `%%"${key}"%%`);
+        catStats.push({ name: cat.name, count: c });
+    }
+    catStats.sort((a, b) => b.count - a.count);
 
-    // Все регионы с количеством подписчиков
-    const regStats = Object.entries(REGIONS).map(([key, reg]) => {
-        const count = db.prepare(`SELECT COUNT(*) as c FROM users WHERE regions LIKE ?`).get(`%"${key}"%`).c;
-        return { name: reg.name, count };
-    }).sort((a, b) => b.count - a.count);
-    const usersWithRegion = db.prepare(`SELECT COUNT(*) as c FROM users WHERE regions != '[]'`).get().c;
+    const regStats = [];
+    for (const [key, reg] of Object.entries(REGIONS)) {
+        const c = await count(`SELECT COUNT(*) as c FROM users WHERE regions::text LIKE ?`, `%%"${key}"%%`);
+        regStats.push({ name: reg.name, count: c });
+    }
+    regStats.sort((a, b) => b.count - a.count);
+    const usersWithRegion = await count(`SELECT COUNT(*) as c FROM users WHERE regions != '[]'::jsonb`);
 
-    // Ночной режим / звук
-    const nightOn  = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.night_mode') = 1").get().c;
-    const silentOn = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.silent') = 1").get().c;
+    const nightOn = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'night_mode' = 'true'");
+    const silentOn = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'silent' = 'true'");
 
     const activeRate = usersTotal ? Math.round(usersActive / usersTotal * 100) : 0;
     const dau = reads24h;
@@ -978,7 +980,7 @@ ${regLines}
 });
 
 // /stats — красивая выжимка для рекламодателей (без лишних деталей)
-bot.command('stats', ctx => {
+bot.command('stats', async ctx => {
     if (!ADMIN_ID || String(ctx.from.id) !== ADMIN_ID) return ctx.reply('⛔ У вас нет доступа.');
 
     const now = Date.now();
@@ -986,19 +988,21 @@ bot.command('stats', ctx => {
     const day7  = now - 7 * 86400000;
     const day30 = now - 30 * 86400000;
 
-    const usersTotal  = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
-    const usersActive = db.prepare("SELECT COUNT(*) as c FROM users WHERE json_extract(notification_settings, '$.mode') != 'off'").get().c;
-    const usersNew7d  = db.prepare(`SELECT COUNT(*) as c FROM users WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?`).get(Math.floor(day7 / 1000)).c;
-    const usersNew30d = db.prepare(`SELECT COUNT(*) as c FROM users WHERE CAST(strftime('%s', created_at) AS INTEGER) >= ?`).get(Math.floor(day30 / 1000)).c;
-    const dau = db.prepare('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?').get(h24).c;
-    const wau = db.prepare('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?').get(day7).c;
+    const usersTotal = await count('SELECT COUNT(*) as c FROM users');
+    const usersActive = await count("SELECT COUNT(*) as c FROM users WHERE notification_settings->>'mode' != 'off'");
+    const usersNew7d = await count(`SELECT COUNT(*) as c FROM users WHERE EXTRACT(EPOCH FROM created_at) >= ?`, Math.floor(day7 / 1000));
+    const usersNew30d = await count(`SELECT COUNT(*) as c FROM users WHERE EXTRACT(EPOCH FROM created_at) >= ?`, Math.floor(day30 / 1000));
+    const dau = await count('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?', h24);
+    const wau = await count('SELECT COUNT(DISTINCT user_id) as c FROM seen_log sl JOIN news n ON sl.news_id = n.id WHERE n.published_at >= ?', day7);
     const activeRate = usersTotal ? Math.round(usersActive / usersTotal * 100) : 0;
     const dauRate = usersTotal ? Math.round(dau / usersTotal * 100) : 0;
 
-    const catStats = Object.entries(CATEGORIES).map(([key, cat]) => {
-        const count = db.prepare(`SELECT COUNT(*) as c FROM users WHERE categories LIKE ?`).get(`%"${key}"%`).c;
-        return { name: cat.name, count };
-    }).sort((a, b) => b.count - a.count);
+    const catStats = [];
+    for (const [key, cat] of Object.entries(CATEGORIES)) {
+        const c = await count(`SELECT COUNT(*) as c FROM users WHERE categories::text LIKE ?`, `%%"${key}"%%`);
+        catStats.push({ name: cat.name, count: c });
+    }
+    catStats.sort((a, b) => b.count - a.count);
     const catLines = catStats.map(c => `${c.name} — <b>${c.count}</b> подп.`).join('\n');
 
     const today = new Date().toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
@@ -1034,7 +1038,7 @@ ${catLines}
     ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
-bot.command('clean_sources', ctx => {
+bot.command('clean_sources', async ctx => {
     if (!ADMIN_ID || String(ctx.from.id) !== ADMIN_ID) return;
 
     // Актуальные источники из конфига
@@ -1050,14 +1054,14 @@ bot.command('clean_sources', ctx => {
     });
 
     // Находим источники которых нет в конфиге
-    const allSources = db.prepare('SELECT DISTINCT source_name FROM news').all().map(r => r.source_name);
+    const allSources = (await db.all('SELECT DISTINCT source_name FROM news')).map(r => r.source_name);
     const deadSources = allSources.filter(s => !activeSources.has(s));
 
     if (deadSources.length === 0) return ctx.reply('✅ Мёртвых источников не найдено.');
 
     const placeholders = deadSources.map(() => '?').join(',');
-    const res1 = db.prepare(`DELETE FROM news WHERE source_name IN (${placeholders})`).run(...deadSources);
-    const res2 = db.prepare('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)').run();
+    const res1 = await db.run(`DELETE FROM news WHERE source_name IN (${placeholders})`, ...deadSources);
+    const res2 = await db.run('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)');
 
     ctx.reply(
         `🧹 <b>Мёртвые источники удалены</b>\n\n` +
@@ -1068,68 +1072,68 @@ bot.command('clean_sources', ctx => {
     );
 });
 
-bot.command('clean_db', ctx => {
+bot.command('clean_db', async ctx => {
     if (!ADMIN_ID || String(ctx.from.id) !== ADMIN_ID) return;
     const cutoffDate = Date.now() - (CONFIG.NEWS_TTL_DAYS * 24 * 60 * 60 * 1000);
-    const res1 = db.prepare('DELETE FROM news WHERE published_at < ?').run(cutoffDate);
-    const res2 = db.prepare('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)').run();
-    MediaCache.clear();
+    const res1 = await db.run('DELETE FROM news WHERE published_at < ?', cutoffDate);
+    const res2 = await db.run('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)');
+    await MediaCache.clear();
     ctx.reply(`🧹 <b>База очищена!</b>\n\nУдалено старых новостей: <b>${res1.changes}</b>\nУдалено логов просмотров: <b>${res2.changes}</b>`, { parse_mode: 'HTML' });
 });
 
 bot.action('set_mode_smart', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); user.notification_settings.mode = 'smart'; CachedRepo.saveSettings(user);
+    const user = await CachedRepo.get(ctx.from.id); user.notification_settings.mode = 'smart'; await CachedRepo.saveSettings(user);
     ctx.answerCbQuery('Умная лента включена').catch(() => {});
     ctx.editMessageText(getSettingsText('smart'), { parse_mode: 'HTML', ...getSettingsMenu(user) }).catch(() => {});
 });
 bot.action('set_mode_custom', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); user.notification_settings.mode = 'custom'; CachedRepo.saveSettings(user);
+    const user = await CachedRepo.get(ctx.from.id); user.notification_settings.mode = 'custom'; await CachedRepo.saveSettings(user);
     ctx.answerCbQuery('Включена рассылка по расписанию').catch(() => {});
     ctx.editMessageText(getSettingsText('custom'), { parse_mode: 'HTML', ...getSettingsMenu(user) }).catch(() => {});
 });
 bot.action('set_mode_off', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); user.notification_settings.mode = 'off'; CachedRepo.saveSettings(user);
+    const user = await CachedRepo.get(ctx.from.id); user.notification_settings.mode = 'off'; await CachedRepo.saveSettings(user);
     ctx.answerCbQuery('Рассылка отключена').catch(() => {});
     ctx.editMessageText(getSettingsText('off'), { parse_mode: 'HTML', ...getSettingsMenu(user) }).catch(() => {});
 });
 bot.action('toggle_silent', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); user.notification_settings.silent = !user.notification_settings.silent; CachedRepo.saveSettings(user);
+    const user = await CachedRepo.get(ctx.from.id); user.notification_settings.silent = !user.notification_settings.silent; await CachedRepo.saveSettings(user);
     ctx.answerCbQuery('Звук изменён').catch(() => {});
     ctx.editMessageReplyMarkup(getSettingsMenu(user).reply_markup).catch(() => {});
 });
 bot.action('toggle_night', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); user.notification_settings.night_mode = !user.notification_settings.night_mode; CachedRepo.saveSettings(user);
+    const user = await CachedRepo.get(ctx.from.id); user.notification_settings.night_mode = !user.notification_settings.night_mode; await CachedRepo.saveSettings(user);
     ctx.answerCbQuery('Ночной режим изменён').catch(() => {});
     ctx.editMessageReplyMarkup(getSettingsMenu(user).reply_markup).catch(() => {});
 });
 bot.action('cycle_interval', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); const v = [0.5, 1, 2, 4, 6, 8, 12, 24]; user.notification_settings.interval = v[(v.indexOf(user.notification_settings.interval) + 1) % v.length] || 0.5;
-    CachedRepo.saveSettings(user); ctx.answerCbQuery('Интервал изменён').catch(() => {}); ctx.editMessageReplyMarkup(getSettingsMenu(user).reply_markup).catch(() => {});
+    const user = await CachedRepo.get(ctx.from.id); const v = [0.5, 1, 2, 4, 6, 8, 12, 24]; user.notification_settings.interval = v[(v.indexOf(user.notification_settings.interval) + 1) % v.length] || 0.5;
+    await CachedRepo.saveSettings(user); ctx.answerCbQuery('Интервал изменён').catch(() => {}); ctx.editMessageReplyMarkup(getSettingsMenu(user).reply_markup).catch(() => {});
 });
 bot.action('cycle_limit', async ctx => {
-    const user = CachedRepo.get(ctx.from.id); const v = [1, 2, 3, 5, 10]; user.notification_settings.limit = v[(v.indexOf(user.notification_settings.limit) + 1) % v.length] || 1;
-    CachedRepo.saveSettings(user); ctx.answerCbQuery('Лимит изменён').catch(() => {}); ctx.editMessageReplyMarkup(getSettingsMenu(user).reply_markup).catch(() => {});
+    const user = await CachedRepo.get(ctx.from.id); const v = [1, 2, 3, 5, 10]; user.notification_settings.limit = v[(v.indexOf(user.notification_settings.limit) + 1) % v.length] || 1;
+    await CachedRepo.saveSettings(user); ctx.answerCbQuery('Лимит изменён').catch(() => {}); ctx.editMessageReplyMarkup(getSettingsMenu(user).reply_markup).catch(() => {});
 });
 bot.action('menu_settings', async ctx => {
-    const user = CachedRepo.get(ctx.from.id);
+    const user = await CachedRepo.get(ctx.from.id);
     ctx.answerCbQuery().catch(() => {}); ctx.editMessageText(getSettingsText(user.notification_settings.mode), { parse_mode: 'HTML', ...getSettingsMenu(user) }).catch(() => {});
 });
 bot.action('menu_reg', async ctx => {
-    const user = CachedRepo.get(ctx.from.id);
+    const user = await CachedRepo.get(ctx.from.id);
     ctx.answerCbQuery().catch(() => {}); ctx.editMessageText('📍 Выберите интересные вам регионы:', getRegionsMenu(user)).catch(() => {});
 });
 bot.action(/toggle_reg_(.+)/, async ctx => {
-    const reg = ctx.match[1]; const user = CachedRepo.get(ctx.from.id);
+    const reg = ctx.match[1]; const user = await CachedRepo.get(ctx.from.id);
     user.regions = user.regions.includes(reg) ? user.regions.filter(r => r !== reg) : [...user.regions, reg];
-    CachedRepo.saveRegions(user); ctx.answerCbQuery().catch(() => {}); ctx.editMessageReplyMarkup(getRegionsMenu(user).reply_markup).catch(() => {});
+    await CachedRepo.saveRegions(user); ctx.answerCbQuery().catch(() => {}); ctx.editMessageReplyMarkup(getRegionsMenu(user).reply_markup).catch(() => {});
 });
 bot.action(/toggle_cat_(.+)/, async ctx => {
-    const cat = ctx.match[1]; const user = CachedRepo.get(ctx.from.id);
+    const cat = ctx.match[1]; const user = await CachedRepo.get(ctx.from.id);
     user.categories = user.categories.includes(cat) ? user.categories.filter(c => c !== cat) : [...user.categories, cat];
-    CachedRepo.saveCategories(user); ctx.answerCbQuery().catch(() => {}); ctx.editMessageReplyMarkup(getMenu(user).reply_markup).catch(() => {});
+    await CachedRepo.saveCategories(user); ctx.answerCbQuery().catch(() => {}); ctx.editMessageReplyMarkup(getMenu(user).reply_markup).catch(() => {});
 });
 bot.action('back_main', async ctx => {
-    const user = CachedRepo.get(ctx.from.id);
+    const user = await CachedRepo.get(ctx.from.id);
     ctx.answerCbQuery().catch(() => {}); ctx.editMessageText('Главное меню:', getMenu(user)).catch(() => {});
 });
 bot.action('show_info', async ctx => {
@@ -1156,7 +1160,7 @@ async function sendRaw(user, news, isManual = false, isSmart = false) {
     const safeTitle = escapeHTML(news.title);
     const safeSource = escapeHTML(news.source_name);
     let footer = `\n\n🔹 Источник: <a href="${news.link}">${safeSource}</a>`;
-    let merged = []; try { merged = JSON.parse(news.merged_sources || '[]'); } catch(e){}
+    let merged = []; try { merged = Array.isArray(news.merged_sources) ? news.merged_sources : JSON.parse(news.merged_sources || '[]'); } catch(e){}
     if (merged.length > 0) footer += `\n🗣 <i>Также пишут: ${escapeHTML(merged.join(', '))}</i>`;
     if (isSmart) footer += `\n⚡️ <i>#ГЛАВНОЕ</i>`;
 
@@ -1174,17 +1178,17 @@ async function sendRaw(user, news, isManual = false, isSmart = false) {
     const extra = { parse_mode: 'HTML', reply_markup: kb, disable_notification: !isManual && user.notification_settings.silent };
 
     if (imgUrl) {
-        let cachedFileId = MediaCache.get(imgUrl);
+        let cachedFileId = await MediaCache.get(imgUrl);
         try {
             if (cachedFileId) {
                 await telegramDispatcher.enqueue(() => bot.telegram.sendPhoto(user.id, cachedFileId, { ...extra, caption }));
-                db.prepare('INSERT OR IGNORE INTO seen_log VALUES (?, ?)').run(user.id, news.id);
+                await db.run('INSERT INTO seen_log (user_id, news_id) VALUES (?, ?) ON CONFLICT (user_id, news_id) DO NOTHING', user.id, news.id);
                 return;
             }
             // Сначала пробуем URL напрямую
             const res = await telegramDispatcher.enqueue(() => bot.telegram.sendPhoto(user.id, imgUrl, { ...extra, caption }));
             if (res && res.photo) {
-                MediaCache.set(imgUrl, res.photo[res.photo.length - 1].file_id);
+                await MediaCache.set(imgUrl, res.photo[res.photo.length - 1].file_id);
             }
         } catch (err) {
             // URL не сработал — качаем буфером с правильными заголовками
@@ -1200,7 +1204,7 @@ async function sendRaw(user, news, isManual = false, isSmart = false) {
                 });
                 const res = await telegramDispatcher.enqueue(() => bot.telegram.sendPhoto(user.id, { source: Buffer.from(resp.data) }, { ...extra, caption }));
                 if (res && res.photo) {
-                    MediaCache.set(imgUrl, res.photo[res.photo.length - 1].file_id);
+                    await MediaCache.set(imgUrl, res.photo[res.photo.length - 1].file_id);
                 }
             } catch (e2) {
                 // Картинка недоступна — отправляем новость без фото
@@ -1212,7 +1216,7 @@ async function sendRaw(user, news, isManual = false, isSmart = false) {
         try { await telegramDispatcher.enqueue(() => bot.telegram.sendMessage(user.id, caption, { ...extra, link_preview_options: { is_disabled: true } })); } catch(e){}
     }
 
-    db.prepare('INSERT OR IGNORE INTO seen_log VALUES (?, ?)').run(user.id, news.id);
+    await db.run('INSERT INTO seen_log (user_id, news_id) VALUES (?, ?) ON CONFLICT (user_id, news_id) DO NOTHING', user.id, news.id);
 }
 
 function pickStrictDiverseNews(batch, user) {
@@ -1231,8 +1235,8 @@ function pickStrictDiverseNews(batch, user) {
 }
 
 async function serveNextNews(ctx) {
-    const user = CachedRepo.get(ctx.from.id);
-    const batch = Repo.getUnseen(user.id, user.categories, user.regions, 50);
+    const user = await CachedRepo.get(ctx.from.id);
+    const batch = await Repo.getUnseen(user.id, user.categories, user.regions, 50);
     if (!batch.length) {
         if (ctx.callbackQuery) return; else return ctx.reply('📭 Пока новых новостей нет.');
     }
@@ -1240,7 +1244,7 @@ async function serveNextNews(ctx) {
     if (!selectedNews) {
         if (ctx.callbackQuery) return; else return ctx.reply('⏳ Ждем посты от других изданий!');
     }
-    db.prepare('UPDATE users SET notification_settings=? WHERE id=?').run(JSON.stringify(user.notification_settings), user.id);
+    await db.run('UPDATE users SET notification_settings=?::jsonb WHERE id=?', JSON.stringify(user.notification_settings), user.id);
     await sendRaw(user, selectedNews, true);
 }
 
@@ -1253,14 +1257,15 @@ const AutoMailer = {
         const now = Date.now(); const currentHourMSK = (new Date().getUTCHours() + 3) % 24;
         let lastId = 0;
         while (true) {
-            const users = db.prepare(`SELECT * FROM users WHERE id > ? AND json_extract(notification_settings, '$.mode') != 'off' ORDER BY id LIMIT ?`).all(lastId, CONFIG.MAILER_BATCH_SIZE);
+            const users = await db.all(`SELECT * FROM users WHERE id > ? AND notification_settings->>'mode' != 'off' ORDER BY id LIMIT ?`, lastId, CONFIG.MAILER_BATCH_SIZE);
             if (!users.length) break;
             for (const rawUser of users) {
                 lastId = rawUser.id;
-            let s; try { s = JSON.parse(rawUser.notification_settings || '{}'); } catch(e) { continue; }
+            let s;
+            try { s = typeof rawUser.notification_settings === 'string' ? JSON.parse(rawUser.notification_settings || '{}') : (rawUser.notification_settings || {}); } catch(e) { continue; }
             const user = {
-                ...rawUser, categories: (() => { try { return JSON.parse(rawUser.categories || '[]'); } catch { return []; } })(),
-                regions: (() => { try { return JSON.parse(rawUser.regions || '[]'); } catch { return []; } })(),
+                ...rawUser, categories: Array.isArray(rawUser.categories) ? rawUser.categories : (() => { try { return JSON.parse(rawUser.categories || '[]'); } catch { return []; } })(),
+                regions: Array.isArray(rawUser.regions) ? rawUser.regions : (() => { try { return JSON.parse(rawUser.regions || '[]'); } catch { return []; } })(),
                 notification_settings: {
                     mode: s.mode || 'smart', interval: s.interval || 4, limit: s.limit || 3, silent: s.silent || false,
                     last_sent: s.last_sent || 0, last_source: s.last_source || '', night_mode: s.night_mode !== undefined ? s.night_mode : true, smart_history: s.smart_history || []
@@ -1270,7 +1275,7 @@ const AutoMailer = {
 
             if (user.notification_settings.mode === 'custom') {
                 if (now - user.notification_settings.last_sent >= user.notification_settings.interval * 3600000) {
-                    const batch = Repo.getUnseen(user.id, user.categories, user.regions, user.notification_settings.limit * 5);
+                    const batch = await Repo.getUnseen(user.id, user.categories, user.regions, user.notification_settings.limit * 5);
                     let sentCount = 0;
                     for (let j = 0; j < batch.length && sentCount < user.notification_settings.limit; j++) {
                         const news = pickStrictDiverseNews(batch, user); if (!news) break;
@@ -1278,7 +1283,7 @@ const AutoMailer = {
                     }
                     if (sentCount > 0) {
                         user.notification_settings.last_sent = now;
-                        db.prepare('UPDATE users SET notification_settings=? WHERE id=?').run(JSON.stringify(user.notification_settings), user.id);
+                        await db.run('UPDATE users SET notification_settings=?::jsonb WHERE id=?', JSON.stringify(user.notification_settings), user.id);
                     }
                 }
             } else if (user.notification_settings.mode === 'smart') {
@@ -1288,11 +1293,11 @@ const AutoMailer = {
                 if (user.categories.length) { conditions.push(`category IN (${user.categories.map(()=>'?').join(',')})`); args.push(...user.categories); }
                 if (user.regions.length) { conditions.push(`region IN (${user.regions.map(()=>'?').join(',')})`); args.push(...user.regions); }
                 if (!conditions.length) continue;
-                const topNews = db.prepare(`SELECT * FROM news WHERE (${conditions.join(' OR ')}) AND merged_sources != '[]' AND length(body) > 50 AND id NOT IN (SELECT news_id FROM seen_log WHERE user_id=?) ORDER BY published_at DESC LIMIT 1`).get(...args, user.id);
+                const topNews = await db.get(`SELECT n.* FROM news n LEFT JOIN seen_log sl ON sl.news_id = n.id AND sl.user_id = ? WHERE (${conditions.join(' OR ')}) AND n.merged_sources != '[]'::jsonb AND length(n.body) > 50 AND sl.news_id IS NULL ORDER BY n.published_at DESC LIMIT 1`, user.id, ...args);
                 if (topNews && topNews.source_name !== user.notification_settings.last_source) {
                     await sendRaw(user, topNews, false, true);
                     user.notification_settings.last_source = topNews.source_name; user.notification_settings.smart_history.push(now);
-                    db.prepare('UPDATE users SET notification_settings=? WHERE id=?').run(JSON.stringify(user.notification_settings), user.id);
+                    await db.run('UPDATE users SET notification_settings=?::jsonb WHERE id=?', JSON.stringify(user.notification_settings), user.id);
                 }
             }
         }
@@ -1305,13 +1310,13 @@ const AutoMailer = {
 
 const ingestTask = cron.schedule('*/5 * * * *', () => { void Ingester.run(); });
 const mailerTask = cron.schedule('* * * * *', () => { void AutoMailer.run(); });
-const cleanupTask = cron.schedule('0 3 * * *', () => {
+const cleanupTask = cron.schedule('0 3 * * *', async () => {
     const cutoffDate = Date.now() - (CONFIG.NEWS_TTL_DAYS * 24 * 60 * 60 * 1000);
-    db.prepare('DELETE FROM news WHERE published_at < ?').run(cutoffDate);
-    db.prepare('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)').run();
-    db.prepare('DELETE FROM seen_log WHERE rowid NOT IN (SELECT rowid FROM seen_log ORDER BY news_id DESC LIMIT 3000000)').run();
+    await db.run('DELETE FROM news WHERE published_at < ?', cutoffDate);
+    await db.run('DELETE FROM seen_log WHERE news_id NOT IN (SELECT id FROM news)');
+    await db.run("DELETE FROM seen_log WHERE seen_at < NOW() - INTERVAL '30 days'");
     // Удаляем старые записи кэша медиа (старше 7 дней)
-    db.prepare('DELETE FROM media_cache WHERE saved_at < ?').run(Date.now() - 7 * 86400000);
+    await db.run('DELETE FROM media_cache WHERE saved_at < ?', Date.now() - 7 * 86400000);
     _mediaCacheMap.clear();
 });
 
@@ -1377,11 +1382,11 @@ bot.action('bc_confirm', async ctx => {
     const isAll = state.targetCats.includes('ALL');
     let audienceCount;
     if (isAll) {
-        audienceCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+        audienceCount = await count('SELECT COUNT(*) as c FROM users');
     } else {
         const conditions = state.targetCats.map(() => 'categories LIKE ?').join(' OR ');
         const params = state.targetCats.map(c => `%"${c}"%`);
-        audienceCount = db.prepare(`SELECT COUNT(*) as c FROM users WHERE ${conditions}`).get(...params).c;
+        audienceCount = await count(`SELECT COUNT(*) as c FROM users WHERE ${conditions}`, ...params);
     }
 
     const catNames = isAll ? 'Все пользователи' : state.targetCats.map(c => CATEGORIES[c]?.name || c).join(', ');
@@ -1423,11 +1428,11 @@ bot.on('message', async (ctx, next) => {
 
     let totalCount = 0;
     if (isAll) {
-        totalCount = db.prepare('SELECT COUNT(*) as c FROM users').get().c;
+        totalCount = await count('SELECT COUNT(*) as c FROM users');
     } else {
         const countConditions = state.targetCats.map(() => 'categories LIKE ?').join(' OR ');
         const countParams = state.targetCats.map(c => `%"${c}"%`);
-        totalCount = db.prepare(`SELECT COUNT(*) as c FROM users WHERE ${countConditions}`).get(...countParams).c;
+        totalCount = await count(`SELECT COUNT(*) as c FROM users WHERE ${countConditions}`, ...countParams);
     }
 
     const statusMsg = await ctx.reply(`⏳ Начинаю рассылку на ${totalCount} получателей...`);
@@ -1437,11 +1442,11 @@ bot.on('message', async (ctx, next) => {
     while (true) {
         let usersBatch;
         if (isAll) {
-            usersBatch = db.prepare('SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ?').all(lastId, CONFIG.BROADCAST_BATCH_SIZE);
+            usersBatch = await db.all('SELECT id FROM users WHERE id > ? ORDER BY id LIMIT ?', lastId, CONFIG.BROADCAST_BATCH_SIZE);
         } else {
             const whereConditions = state.targetCats.map(() => 'categories LIKE ?').join(' OR ');
             const params = state.targetCats.map(c => `%"${c}"%`);
-            usersBatch = db.prepare(`SELECT id FROM users WHERE id > ? AND (${whereConditions}) ORDER BY id LIMIT ?`).all(lastId, ...params, CONFIG.BROADCAST_BATCH_SIZE);
+            usersBatch = await db.all(`SELECT id FROM users WHERE id > ? AND (${whereConditions}) ORDER BY id LIMIT ?`, lastId, ...params, CONFIG.BROADCAST_BATCH_SIZE);
         }
         if (!usersBatch.length) break;
         for (const row of usersBatch) {
@@ -1465,6 +1470,7 @@ bot.on('message', async (ctx, next) => {
 
 (async () => {
     logger.info('Flash News v73.0 started. Admin ID: ' + ADMIN_ID);
+    await initDb();
     await Ingester.run();
     await bot.launch();
     setupGracefulShutdown({
